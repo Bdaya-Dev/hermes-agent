@@ -1943,6 +1943,12 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         sample = _system_memory_sample()
     if not sample:
         return "unknown"
+    # An unconstrained cgroup v2 cgroup (``memory.max == "max"``) cannot be
+    # OOM-killed by its own limit, so the host-wide /proc verdict describes other
+    # tenants, not this process: fail open instead of throttling the whole fleet
+    # because the host is busy (#118117).
+    if sample.get("cgroup_unconstrained") is True:
+        return "unknown"
     try:
         from gateway.memory_status import classify_pressure
         return classify_pressure(sample.get("mem_available_kib"), sample.get("mem_total_kib"))
