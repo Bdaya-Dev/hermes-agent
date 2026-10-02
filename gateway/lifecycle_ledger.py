@@ -61,9 +61,53 @@ def _proc_fields(path: str, wanted: Dict[str, str]) -> Dict[str, int]:
     return found
 
 
-def sample_memory() -> Dict[str, Any]:
+# cgroup v2 unified-memory root. Overridable so tests can point at a fixture tree.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _cgroup_memory(cgroup_root: str = CGROUP_ROOT) -> Dict[str, Any]:
+    """cgroup v2 memory limit/usage for THIS process' cgroup (KiB).
+
+    ``{}`` when unavailable (cgroup v1, unreadable files, non-Linux) — the caller
+    then keeps the host /proc view. ``memory.max`` of ``max`` means the cgroup
+    is UNLIMITED: reported as ``{"cgroup_unconstrained": True}`` with no numeric
+    ceiling, because a container that provably cannot be OOM-killed by its own
+    limit must not inherit a host-wide pressure verdict.
+    """
+    try:
+        with open(os.path.join(cgroup_root, "memory.max"), encoding="utf-8") as fh:
+            raw_max = fh.read().strip()
+    except (OSError, ValueError):
+        return {}
+    if raw_max == "max":
+        return {"cgroup_unconstrained": True}
+    try:
+        max_kib = int(raw_max) // 1024
+    except ValueError:
+        return {}
+    if max_kib <= 0:
+        return {}
+    out: Dict[str, Any] = {"cgroup_max_kib": max_kib}
+    try:
+        with open(os.path.join(cgroup_root, "memory.current"), encoding="utf-8") as fh:
+            out["cgroup_current_kib"] = int(fh.read().strip()) // 1024
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def sample_memory(cgroup_root: str = CGROUP_ROOT) -> Dict[str, Any]:
     """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable.
+
+    Inside a container, /proc/meminfo is the HOST view (no lxcfs), so the
+    reported totals are the memory THIS process may actually use: the cgroup v2
+    limit when it is finite, and the host figures when it is not. A finite limit
+    lower than MemTotal is the real budget — without it a 1 GiB container derives
+    a cap sized for a 32 GiB host (#118117). An unlimited limit
+    (``memory.max == "max"``) sets ``cgroup_unconstrained`` so pressure
+    classification fails open instead of reporting another tenant's pressure.
+    """
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -71,6 +115,20 @@ def sample_memory() -> Dict[str, Any]:
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
+    sample.update(_cgroup_memory(cgroup_root))
+    limit = sample.get("cgroup_max_kib")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        total = sample.get("mem_total_kib")
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            sample["mem_total_kib"] = min(total, limit)
+        available = sample.get("mem_available_kib")
+        current = sample.get("cgroup_current_kib")
+        if isinstance(available, int) and not isinstance(available, bool) and available >= 0:
+            # Headroom inside the cgroup is what matters: host MemAvailable counts
+            # pages this container may never touch.
+            if isinstance(current, int) and not isinstance(current, bool):
+                available = min(available, max(0, limit - current))
+            sample["mem_available_kib"] = available
     return sample
 
 
